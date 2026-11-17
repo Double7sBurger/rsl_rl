@@ -58,6 +58,7 @@ class SuperMimic:
         obs_groups: dict[str, list[str]],
         # Update cadence parameters
         updates_per_step: float = 0.4,
+        update_schedule: str = "after_warmup",
         num_warmup_steps: int = 64,
         num_world_model_warmup_iterations: int = 500,
         # World model parameters
@@ -65,6 +66,7 @@ class SuperMimic:
         world_model_window: int = 8,
         world_model_batch_size: int = 2048,
         world_model_loss_reduction: str = "sum",
+        world_model_full_windows: bool = False,
         # Policy parameters
         num_policy_updates: int = 1,
         horizon: int = 32,
@@ -79,12 +81,14 @@ class SuperMimic:
         num_critic_mini_batches: int = 4,
         critic_survival_weighting: bool = True,
         critic_bootstrap_clipping: bool = True,
+        critic_shuffle_each_epoch: bool = True,
         # Optimizer parameters
         learning_rate: float = 2e-4,
         max_grad_norm: float = 1.0,
         # Learning rate schedule parameters
         num_schedule_updates: int = 250_000,
         final_learning_rate_ratio: float = 0.03,
+        learning_rate_schedule_unit: str = "learner_updates",
         # Execution parameters
         use_mixed_precision: bool = False,
         use_cuda_graph: bool = False,
@@ -105,12 +109,14 @@ class SuperMimic:
             task: Differentiable task heads and physical state coordinates.
             obs_groups: Explicit physical observation-set mapping.
             updates_per_step: Learner iterations accrued per collected environment step.
+            update_schedule: Accrue update credit after warmup or from the first collected step.
             num_warmup_steps: Stored steps per environment required before learning.
             num_world_model_warmup_iterations: Learner iterations fitting only dynamics.
             num_world_model_updates: Dynamics optimizer steps per learner iteration.
             world_model_window: Maximum autoregressive dynamics fitting horizon.
             world_model_batch_size: Replay anchors per dynamics optimizer step.
             world_model_loss_reduction: Sum over a replay window or mean over all valid positions.
+            world_model_full_windows: Sample complete sequences of stored states, excluding reset boundaries.
             num_policy_updates: Actor updates and associated critic fits per learner iteration.
             horizon: Imagined policy horizon.
             policy_batch_size: Starts per actor update.
@@ -124,10 +130,12 @@ class SuperMimic:
             num_critic_mini_batches: Minibatches per critic epoch.
             critic_survival_weighting: Weight value regression by imagined survival probabilities.
             critic_bootstrap_clipping: Cap values before computing critic return targets.
+            critic_shuffle_each_epoch: Draw new minibatches each epoch instead of reusing one permutation.
             learning_rate: Initial learning rate for all optimizers.
             max_grad_norm: Global gradient-norm limit for each model.
             num_schedule_updates: Learner iterations in the shared cosine learning-rate schedule.
             final_learning_rate_ratio: Final learning rate relative to its initial value.
+            learning_rate_schedule_unit: Measure schedule progress in learner updates or collected env steps.
             use_mixed_precision: Enable BF16 matrix operations while integrating physical states in FP32.
             use_cuda_graph: Capture each learner iteration in a CUDA graph. Requires a CUDA device and task heads
                 without host synchronization.
@@ -155,6 +163,12 @@ class SuperMimic:
             raise ValueError("Learning counts, cadence, learning rate and gradient limit must be positive.")
         if num_warmup_steps < world_model_window or num_world_model_warmup_iterations < 0:
             raise ValueError("num_warmup_steps must cover the model window; world-model warmup must be nonnegative.")
+        if world_model_full_windows and num_warmup_steps <= world_model_window:
+            raise ValueError("Complete replay windows need world_model_window + 1 stored states before learning.")
+        if update_schedule not in ("after_warmup", "from_start"):
+            raise ValueError("update_schedule must be 'after_warmup' or 'from_start'.")
+        if learning_rate_schedule_unit not in ("learner_updates", "env_steps"):
+            raise ValueError("learning_rate_schedule_unit must be 'learner_updates' or 'env_steps'.")
         if not 0 <= gamma < 1 or not 0 <= lam <= 1 or not 0 <= final_learning_rate_ratio <= 1:
             raise ValueError("Invalid discount, lambda or final learning-rate ratio.")
         if action_noise < 0:
@@ -200,6 +214,10 @@ class SuperMimic:
 
         # Update cadence parameters
         self.updates_per_step = updates_per_step
+        self.update_schedule = update_schedule
+        self.learning_rate_schedule_unit = learning_rate_schedule_unit
+        self.env_steps = 0
+        self._scheduled_updates = 0
         self.num_warmup_steps = num_warmup_steps
         self.num_world_model_warmup_iterations = num_world_model_warmup_iterations
 
@@ -210,8 +228,10 @@ class SuperMimic:
         if world_model_loss_reduction not in ("sum", "mean"):
             raise ValueError("world_model_loss_reduction must be 'sum' or 'mean'.")
         self.world_model_loss_reduction = world_model_loss_reduction
+        self.world_model_full_windows = world_model_full_windows
         self.critic_survival_weighting = critic_survival_weighting
         self.critic_bootstrap_clipping = critic_bootstrap_clipping
+        self.critic_shuffle_each_epoch = critic_shuffle_each_epoch
 
         # Policy parameters
         self.num_policy_updates = num_policy_updates
@@ -310,7 +330,9 @@ class SuperMimic:
         self.actor.reset(done, reset_action, reset_previous)
         self._window_break_sum.add_(window_break.float().mean())
         self._collected_steps += 1
+        self.env_steps += 1
         self._update_debt += self.updates_per_step
+        self.task.process_env_step(goal, rewards, done, extras)
         self._last_obs = self._last_actions = self._last_previous_actions = None
 
     def compute_returns(self, obs: TensorDict) -> None:
@@ -319,7 +341,11 @@ class SuperMimic:
 
     def _windows(self, batch_size: int) -> tuple[TensorDict, torch.Tensor]:
         """Sample uniform anchors, additionally cutting world-model targets after external state edits."""
-        index = self.storage.sample(batch_size, length=self.world_model_window)
+        if self.world_model_full_windows:
+            index = self.storage.sample_sequences(batch_size, self.world_model_window + 1)
+            index.ids, index.valid = index.ids[:, :-1], index.valid[:, :-1]
+        else:
+            index = self.storage.sample(batch_size, length=self.world_model_window)
         keys = ["state", "next_state", "actions", "context", "prev_actions", "window_break"]
         if self.task.num_labels:
             keys.append("labels")
@@ -472,8 +498,13 @@ class SuperMimic:
         if not self.critic_survival_weighting:
             reach = torch.ones_like(reach)
         losses = []
+        permutation = None
         for _ in range(self.num_critic_epochs):
-            permutation = torch.rand(features.shape[0], device=self.device).argsort()
+            if self.critic_shuffle_each_epoch:
+                permutation = torch.rand(features.shape[0], device=self.device).argsort()
+            elif permutation is None:
+                size = features.shape[0] // self.num_critic_mini_batches * self.num_critic_mini_batches
+                permutation = torch.randperm(size, device=self.device)
             for indices in permutation.chunk(self.num_critic_mini_batches):
                 with torch.autocast(
                     torch.device(self.device).type, dtype=torch.bfloat16, enabled=self.use_mixed_precision
@@ -535,12 +566,21 @@ class SuperMimic:
             totals["window_break_fraction"] = [self._window_break_sum / self._collected_steps]
             self._collected_steps = 0
         count = 0
-        if self.storage.num_steps < self.num_warmup_steps:
+        if self.update_schedule == "from_start":
+            scheduled = int(max(self.env_steps - 1, 0) * self.updates_per_step) + int(self.env_steps > 0)
+            count = scheduled - self._scheduled_updates
+            self._scheduled_updates = scheduled
+            if self.storage.num_steps < self.num_warmup_steps:
+                count = 0
+            self._update_debt = 0.0
+        elif self.storage.num_steps < self.num_warmup_steps:
             self._update_debt = 0.0
         else:
             count = int(self._update_debt + 1e-9)
             self._update_debt -= count
         for _ in range(count):
+            if self.learning_rate_schedule_unit == "env_steps":
+                self._update_learning_rate()
             update_policy = self.iteration >= self.num_world_model_warmup_iterations
             if self.use_cuda_graph:
                 if update_policy not in self._graph_updates:
@@ -553,7 +593,8 @@ class SuperMimic:
             for key, value in stats.items():
                 totals.setdefault(key, []).append(value)
             self.iteration += 1
-            self._update_learning_rate()
+            if self.learning_rate_schedule_unit == "learner_updates":
+                self._update_learning_rate()
         if totals:
             means = torch.stack([torch.stack(values).float().mean() for values in totals.values()]).tolist()
             metrics.update(zip(totals, means))
@@ -575,7 +616,8 @@ class SuperMimic:
 
     def _update_learning_rate(self) -> None:
         """Set all optimizer rates for the next learner iteration, clamping at the cosine floor."""
-        progress = min(self.iteration / self.num_schedule_updates, 1.0)
+        step = max(self.env_steps - 1, 0) if self.learning_rate_schedule_unit == "env_steps" else self.iteration
+        progress = min(step / self.num_schedule_updates, 1.0)
         self.learning_rate = self.initial_learning_rate * (
             self.final_learning_rate_ratio
             + (1 - self.final_learning_rate_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
@@ -637,6 +679,7 @@ class SuperMimic:
             "world_model_state_dict": self.world_model.state_dict(),
             **{f"{key}_optimizer_state_dict": optimizer.state_dict() for key, optimizer in self.optimizers.items()},
             "iteration": self.iteration,
+            "env_steps": self.env_steps,
         }
         if self.actor_ema is not None:
             saved["actor_ema_state_dict"] = {
@@ -678,6 +721,10 @@ class SuperMimic:
                 self._configure_optimizer_capture()
             if load_cfg.get("iteration"):
                 self.iteration = loaded_dict["iteration"]
+                self.env_steps = loaded_dict.get("env_steps", 0)
+                self._scheduled_updates = int(max(self.env_steps - 1, 0) * self.updates_per_step) + int(
+                    self.env_steps > 0
+                )
         self.storage.clear()
         self.actor.reset()
         self._last_obs = self._last_actions = self._last_previous_actions = None
