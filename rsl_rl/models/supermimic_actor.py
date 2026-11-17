@@ -41,6 +41,9 @@ class SuperMimicActor(nn.Module):
         latent_dim: int = 32,
         encoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256),
         decoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256),
+        activation: str = "elu",
+        norm: str = "none",
+        output_gain: float = 0.01,
     ) -> None:
         """Construct the networks and nonpersistent collection history."""
         super().__init__()
@@ -49,11 +52,22 @@ class SuperMimicActor(nn.Module):
         self.task, self.obs_groups = task, obs_groups
         self.obs_dim, self.goal_dim = obs_dim, goal_dim
         self.history_length, self.num_actions = history_length, num_actions
-        self.encoder = MLP(goal_dim, latent_dim, encoder_hidden_dims) if goal_dim else nn.Identity()
-        self.decoder = MLP(obs_dim * history_length + (latent_dim if goal_dim else 0), num_actions, decoder_hidden_dims)
+        self.encoder = (
+            MLP(goal_dim, latent_dim, encoder_hidden_dims, activation=activation, norm=norm)
+            if goal_dim
+            else nn.Identity()
+        )
+        self.decoder = MLP(
+            obs_dim * history_length + (latent_dim if goal_dim else 0),
+            num_actions,
+            decoder_hidden_dims,
+            activation=activation,
+            norm=norm,
+        )
         with torch.no_grad():
-            self.decoder.output_layer.weight.mul_(0.01)
-            self.decoder.output_layer.bias.zero_()
+            self.decoder.output_layer.weight.mul_(output_gain)
+            if output_gain != 1.0:
+                self.decoder.output_layer.bias.zero_()
         self.obs_norm = EmpiricalNormalization(obs_dim)
         self.goal_norm = EmpiricalNormalization(goal_dim) if goal_dim else nn.Identity()
         self.register_buffer("history", torch.zeros(num_envs, history_length, obs_dim), persistent=False)
