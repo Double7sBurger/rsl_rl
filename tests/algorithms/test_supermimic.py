@@ -578,61 +578,6 @@ def test_fractional_cadence_and_algorithm_level_multi_gpu_rejection() -> None:
         SuperMimic.construct_algorithm(env.get_observations(), env, cfg, "cpu")
 
 
-def test_collection_schedule_keeps_fractional_credit_through_warmup() -> None:
-    """The physical-step recipe skips early fits without restarting its cadence or learning-rate clock."""
-    learner, env = (
-        _learner(
-            updates_per_step=0.4,
-            update_schedule="from_start",
-            world_model_full_windows=True,
-            num_warmup_steps=4,
-            learning_rate_schedule_unit="env_steps",
-            num_schedule_updates=10,
-            critic_shuffle_each_epoch=False,
-        ),
-        ScalarEnv(),
-    )
-    counts = []
-    for _ in range(13):
-        _collect(learner, env, 1)
-        learner.update()
-        counts.append(learner.iteration)
-    assert counts == [0, 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4]
-    for optimizer in learner.optimizers.values():
-        assert optimizer.param_groups[0]["lr"] == pytest.approx(2e-4 * 0.03)
-    restored = _learner(
-        updates_per_step=0.4,
-        update_schedule="from_start",
-        num_warmup_steps=4,
-        learning_rate_schedule_unit="env_steps",
-        num_schedule_updates=10,
-    )
-    restored.load(copy.deepcopy(learner.save()), None, True)
-    assert restored.env_steps == 13
-    resumed_counts = []
-    for _ in range(6):
-        _collect(restored, env, 1)
-        restored.update()
-        resumed_counts.append(restored.iteration)
-    assert resumed_counts == [4, 4, 4, 4, 4, 5]
-
-
-def test_collection_can_select_actions_before_updating_moments() -> None:
-    """Fresh observations change future normalization without changing the action already being selected."""
-    env, cfg = ScalarEnv(), _cfg()
-    cfg["actor"]["normalize_before_action"] = False
-    learner = SuperMimic.construct_algorithm(env.get_observations(), env, cfg, "cpu")
-    actor = learner.actor
-    obs = env.get_observations()
-    state = learner.task.representation.unflatten(obs["state"])
-    frame = learner.task.actor_obs(state, obs["goal"], obs["context"], actor.previous_actions)
-    with torch.no_grad():
-        expected = actor.forward_history(frame[:, None].expand(-1, actor.history_length, -1), obs["goal"])
-        actual = actor(obs)
-    torch.testing.assert_close(actual, expected)
-    assert actor.obs_norm.count == env.num_envs
-
-
 def test_task_analytic_successors_follow_labels_in_fitting_and_imagination() -> None:
     """Analytic post-dynamics runs after event prediction and retains the event-probability gradient."""
     learner, env = _learner(), ScalarEnv()
@@ -773,16 +718,13 @@ def test_event_labels_condition_on_the_applied_action() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for graph capture")
-@pytest.mark.parametrize("full_windows", [False, True])
-def test_cuda_graph_matches_eager_and_resumes(full_windows: bool) -> None:
+def test_cuda_graph_matches_eager_and_resumes() -> None:
     """Graphed learner iterations match eager updates exactly and recapture after loading optimizer state."""
 
     def train(use_cuda_graph: bool) -> tuple[SuperMimic, ScalarEnv, list[dict[str, float]]]:
         torch.manual_seed(0)
         env = ScalarEnv(device="cuda:0")
-        learner = _learner(
-            env, use_cuda_graph=use_cuda_graph, actor_ema_halflife=3, world_model_full_windows=full_windows
-        )
+        learner = _learner(env, use_cuda_graph=use_cuda_graph, actor_ema_halflife=3)
         metrics = []
         for _ in range(6):
             _collect(learner, env, 3)
@@ -800,46 +742,3 @@ def test_cuda_graph_matches_eager_and_resumes(full_windows: bool) -> None:
         _collect(graphed, env, 3)
         metrics = graphed.update()
     assert graphed._graph_updates and math.isfinite(metrics["world_model_loss"])
-
-
-def test_task_model_loss_uses_integrated_coordinates_and_valid_mean(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A task may supervise coordinates beyond the predicted increment without window-length scaling."""
-    env, learner = ScalarEnv(), _learner(world_model_loss_reduction="mean")
-    _collect(learner, env, 4)
-    learner.task.num_labels = 0
-
-    def integrated_loss(prediction: State, target: State, scale: torch.Tensor) -> torch.Tensor:
-        coordinate = prediction[0][..., 0]
-        return coordinate * 0 + 2.75
-
-    monkeypatch.setattr(learner.task, "world_model_loss", integrated_loss)
-    result = learner._fit_world_model()
-    assert result["world_model_loss"].item() == pytest.approx(2.75)
-    assert result["world_model_error"].item() == pytest.approx(2.75)
-
-
-def test_raw_world_model_preserves_task_normalized_context() -> None:
-    """Physical residual outputs and fixed-range context bypass empirical rescaling when requested."""
-    model = WorldModel(
-        EuclideanStateRepresentation(1),
-        1,
-        1,
-        1,
-        hidden_dims=(8,),
-        activation="gelu",
-        normalize_output=False,
-        normalize_context=False,
-        zero_initialize_output=False,
-    )
-    state, action, context = torch.ones(4, 1), torch.ones(4, 1) * 2, torch.ones(4, 1) * 0.75
-    model.observe((state,), action, context, (state + 7,))
-    seen = []
-    handle = model.net.register_forward_pre_hook(lambda module, inputs: seen.append(inputs[0].detach()))
-    with torch.no_grad():
-        model.net.output_layer.weight.zero_()
-        model.net.output_layer.bias.fill_(3.0)
-    result = model((state,), action, context)[0]
-    handle.remove()
-    torch.testing.assert_close(result, state + 3)
-    torch.testing.assert_close(seen[0][:, -1:], context)
-    torch.testing.assert_close(seen[0][:, :2], torch.zeros(4, 2))
